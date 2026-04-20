@@ -1,602 +1,959 @@
-//Program deletes VMF parameters with default values, since missing parameters are automatically replaced with defaults, hence lossless optimization
-//Made with TF2 in mind, but supports .vmf of any game
-//Uses default Hammer/Hammer++ default values as an example. Custom FGDs not accounted.
-#include <iostream>
-#include <string>
+/*
+ * Uses default Hammer/Hammer++ default values as an example. Custom FGDs not accounted.
+ */
+
+#include <algorithm>
 #include <fstream>
+#include <string>
+#include <string_view>
+#include <cstring>
+#include <cstdlib>
 #include <chrono>
+
+#ifdef _WIN32
+extern "C"
+{
+#include <io.h>
+}
+#define F_OK 0
+#define access _access
+#else
+extern "C"
+{
+#include <linux/limits.h>
+#include <unistd.h>
+}
+#endif
+
+#define LOG(...) printf(__VA_ARGS__); if (savelog) fprintf(log, __VA_ARGS__);
+#define VER(...) if (verbose) printf(__VA_ARGS__); if (savelog) fprintf(log, __VA_ARGS__);
+
 using namespace std;
-//TO DO:
-//multiple files support
-//options to remove the old file
-//option to remove lightmap values (default off cause the default lightmap value can be changed; if on, removes parameter if the value is 16 [default if unconfigured])
-string removeExtraChars(const string& line){//thanks lorenzolanglois for the idea
+
+// Global variables
+static bool verbose = false;
+static bool carriages = false;
+static bool prefab = false;
+static bool process_solids = true;
+static bool process_entities = true;
+static bool remove_comment = false;
+static bool remove_vplus = true;
+static bool inplace = false;
+static bool strip_ws = true;
+static const char* savelog = nullptr;
+static unsigned long long int count_i_all = 0, count_o_all = 0;
+static FILE* log;
+
+const string suffix("-optimized");
+
+// The state of the current "chunk" in the VMF
+enum State
+{
+    WORLD,
+    SOLID,
+    ENTITY,
+    CLASS,
+};
+
+enum Type
+{
+    NONE,
+    PROP_STATIC,
+    PROP_DYNAMIC,
+    PROP_OTHER,
+    FUNC_BRUSH,
+    FUNC_DETAIL,
+    FUNC_DOOR,
+    FUNC_AREAPORTAL,
+    FUNC_AREAPORTALWINDOW,
+    LIGHT,
+    LIGHT_SPOT,
+    LIGHT_DYNAMIC,
+    LIGHT_ENVIRONMENT,
+    INFO_DECAL,
+    INFO_OVERLAY,
+    INFO_PARTICLE_SYSTEM,
+    ITEM_PACK,
+    TRIGGER_ONCE,
+    TRIGGER_MULTIPLE,
+    TRIGGER_HURT,
+    AMBIENT_GENERIC,
+    POINT_SPOTLIGHT,
+    BRUSH_ENTITIES,
+    MOVE_ROPE,
+    EDITOR
+};
+
+static string remove_whitespaces(const string_view line)
+{
     string result;
     result.reserve(line.size());
-    for (size_t i = 0; i < line.size();){
-        if (i + 2 < line.size() && line[i] == '"' && line[i+1] == ' ' && line[i+2] == '"'){
+    for (size_t i = 0; i < line.size();)
+    {
+        if (i + 2 < line.size() && line[i] == '"' && line[i+1] == ' ' && line[i+2] == '"')
+        {
             result += "\"\"";
             i += 3;
-        }else{
-            char c = line[i];
-            if (c != '\r' && c != '\n' && c != '\t'){
+        }
+        else
+        {
+            const char c = line[i];
+            if (c != '\r' && c != '\n' && c != '\t')
                 result += c;
-            } ++i;
+            i++;
         }
     }
     return result;
 }
-int main() {
-    //cout<<"VMF optimizer by dabmasterars."<<endl<<R"(Make sure that the path to the file doesn't contain any whitespace characters! Example: "C:\My maps\map.vmf" won't work)"<<endl<<"Drop your .vmf file here or type file name: "<<endl;//the bug is fixed
-    cout<<"VMF optimizer by dabmasterars.\nMultiple files have to be inserted consecutively.\nDrop your .vmf file here or type file name: "<<endl;
-    string filename;//filename, reused later as a buffer
-    //cin>>line;
-    getline(std::cin, filename);//have to do it getline way, otherwise doesn't read whitespace
-    if (filename.length()==0) exit(0);
-    ifstream in;
-    unsigned long long int count_t_all=0, count_r_all=0;//total lines/removed lines in all files
-    unsigned short int filecount=0;
-    bool verbose=0, remove_lightmap=0, remove_vertplus=1, remove_ws=1, savelog=1, tagopti=1;
-    ifstream settings("settings.ini");
-    if (!settings.is_open()) {
-        cout << "Settings file missing or corrupted. Restoring file with default settings." << endl;
-        ofstream restore("settings.ini");
-        restore<<"verbose 0\n"
-                 "remove_lightmap 0\n"
-                 "remove_vertplus 1\n"
-                 "remove_ws 1\n"
-                 "savelog 1\n"
-                 "tag 1\n"
-                 //"backup 1\n"//i don't know how to implement this
-                 "%%\n"
-                 "\n"
-                 "parameter (default value) - explanation\n"
-                 "\n"
-                 "verbose (0) - If 1, program outputs more detailed information. Affects log.\n"
-                 "remove_lightmap (0) - If 1, lightmap data is removed. \n"
-                 "remove_vertplus (1) - If 1, vertices_plus data is removed (Hammer++ only).\n"
-                 "remove_ws (1) - If 1, whitespaces, tabs and newlines are removed.\n"
-                 "savelog (1) - If 1, a log file is made after the program stops working.\n"
-                 "tag (1) - If 1, tags the file as optimized, preventing the files to be optimized again.\n";
-                 //"backup (1) - If 1, leaves the old copy of the file. Turn off at your risk.";
-        restore.close();
-    }
-    else{//setting menu. i can probably optimize it better
-        string param; bool val;
-        while(param!="%%") {
-            settings >> param;
-            settings >> val;
-            if (param=="verbose"){
-                verbose=val;
+
+static bool inline contains(const string_view str, const string_view sub)
+{
+    return str.find(sub) != string::npos;
+}
+
+// Prints the command line usage
+static void usage(const char* prg)
+{
+    printf("Usage: %s (options) (vmf-file) [(vmf-file-...)]\n  -h|--help         : Show help.\n  -i|--in-place     : Replace the original file.\n  -l|--log (file)   : Save the output to a separate log file.\n  -o|--output (dir) : Put all outputs to a specific directory.\n  -p|--prefab       : Erase editor-specific informations (intended for prefabs).\n  --skip-solids     : Skip solid processing.\n  --skip-defaults   : Skip removing entity parameters with default values.\n  --remove-comment  : Remove the map comment.\n  --keep-vert-plus  : Keep vertices plus informations (Hammer++ specific).\n  --keep-whitespace : Do not strip whitespaces to output lines (indentation, etc).\n  -c|-r|--carriages : Output with carriage returns in addition to line feeds.\n  -v|--verbose      : More verbose output.\n", prg);
+}
+
+static void optimize(ifstream& in, ofstream& out)
+{
+    unsigned int count_i = 0, count_o = 0;
+    unsigned char gate = 0;
+    bool isprefab = prefab;
+
+    // Measure time taken
+    auto timestart = chrono::high_resolution_clock::now();
+
+    Type type = NONE;
+    State state = WORLD;
+    streampos pos;
+    string line_base, line_low, line_raw;
+    while (getline(in, line_base))
+    {
+        // Strip carriage returns to simplify comparisons
+        line_base.erase(remove(line_base.begin(), line_base.end(), '\r'), line_base.end());
+
+        // Skip empty lines
+        if (line_base.empty())
+            goto WRITE;
+
+        // Precompute lowercase and whitespace-free version of the line for faster comparisons
+        line_low = line_base;
+        transform(line_low.begin(), line_low.end(), line_low.begin(), [](const unsigned char c) { return tolower(c); });
+        line_raw = line_low;
+        line_raw.erase(remove_if(line_raw.begin(), line_raw.end(), ::isspace), line_raw.end());
+
+        // Branch on the state
+        if (state == WORLD)
+        {
+            // Check if prefab
+            if (!isprefab && contains(line_low, "prefab\" \"1"))
+            {
+                isprefab = true;
+                VER("INFO:  File identified as a prefab\n");
             }
-            else if (param=="remove_vertplus"){
-                remove_vertplus=val;
+
+            // Remove the comment
+            if (remove_comment && contains(line_low, "\"comment\""))
+            {
+                VER("INFO:  Found solid at line: %d\n", count_i + 1);
+                goto NEXT;
             }
-            else if (param=="remove_ws"){
-                remove_ws=val;
+
+            // To the next state
+            if (line_raw == "solid")
+            {
+                VER("INFO:  Found solid chunk at line: %d\n", count_i + 1);
+                state = SOLID;
             }
-            else if (param=="savelog"){
-                savelog=val;
-            }
-            else if (param=="tag"){
-                tagopti=val;
-            }
-//            else if (param=="backup"){
-//                backup=val;
-//            }
         }
-        if (verbose){
-            cout<<"\nSettings loaded successfully.\nverbose "<<verbose<<"\nremove_vertplus "<<remove_vertplus<<"\nremove_ws "<<remove_ws<<"\nsavelog "<<savelog<<"\ntag "<<tagopti<<"\n\n";
-        }
-    }
-    settings.close();
-    ofstream log;
-    if (savelog){ log.open("log.txt"); if (verbose) log<<"Current settings:\nverbose "<<verbose<<"\nremove_vertplus "<<remove_vertplus<<"\nsavelog "<<savelog<<"\ntag "<<tagopti<<"\n\n";}
-    while(filename.length()!=0) {//cycle until you press enter without typing anything (otherwise it will start working with a new file)
-        bool errorcheck=0;
-        if (filename.at(0) == '\"') {//erases the quotmarks that windows inserts if the file path has whitespaces
-            filename.erase(filename.begin());
-            filename.erase(filename.length() - 1);
-        }
-        if (filename.find(".vmf") == string::npos) in.open(filename.append(".vmf"));
-        else in.open(filename);
-        //ifstream in("file.txt");//test input
-        if (!in.is_open()) {
-            cerr << "Error. File \"" << filename << "\" doesn't exist." << endl;
-            if (savelog)log << "Error. File \"" << filename << "\" doesn't exist.";
-            errorcheck=1;
-        }
-        ofstream out((filename.erase(filename.length() - 4)).append("_opti.vmf"));//output
-        //ofstream out("file2.txt");//test output
-        if (!out.is_open()) {
-            cerr << "Output error." << endl;
-            if (savelog) log << "Output error.";
-            errorcheck=1;
-        }
-        string line;
-        if (getline(in, line)&&line=="optimized{}"){
-            cout<<"File is already optimized.";
-            if (savelog) log << "File is already optimized.";
-            errorcheck=1;
-        }
-        size_t pos = filename.find_last_of('\\');
-        if (pos != std::string::npos) {
-            filename.erase(0, pos + 1);
-        }
-        filename.erase(filename.length() - 9);
-        if(errorcheck){
-            cout << "\n\nSkipped " << filename << ".\nPress ENTER to finish program. If you wish to continue, drop another file here or type file name:";
-            if (savelog) log << "\n\nSkipped " << filename << ".\n";
-        }
-        else {
-            cout << "\nCompressing " << filename << " . . .\n\n\n";
-            auto timestart = std::chrono::high_resolution_clock::now();
-            unsigned char type;
-            //0 - none, 1 - prop_static, 2 - prop_dynamic, 3 - prop_physics, 4 - func_detail, 5 - func_brush, 6 - light, 7 - light_spot, 8 - light_dynamic, 9 - func_door/func_door_rotating
-            //10 - info_decal, 11 - info overlay, 12 - trigger_once/remove, 13 - trigger_multiple, 14 - trigger_hurt, 15 - func_areaportal, 16 - func_areaportalwindow, 17 - ambient_generic, 18 - brush entities
-            //19 - light_environment, 20 - item_ammopack/item_healthkit, 21 - move/keyframe_rope, 22 - info_particle_system, 23 - point_spotlight
-            unsigned int count_t = 0, count_r = 0;//total lines/removed lines
-            bool isprefab = 0;
-            if (tagopti) out << "optimized{}" << endl;
-            if (remove_ws) out << removeExtraChars(line);
-            else out << line << "\n";
-            count_t++;
-            while (getline(in, line) && line != "viewsettings") {
-                if (line.find("prefab\" \"1") != string::npos) {
-                    isprefab = 1;
-                    if (verbose) {
-                        cout << "File identified as a prefab.\n";
-                        if (savelog) log << "File identified as a prefab.\n";
-                    }
-                }
-                if (remove_ws) out << removeExtraChars(line);
-                else out << line << "\n";
-                count_t++;
-            }
-            if (isprefab) {
-                while (getline(in, line) && line != "world") {
-                    count_r++;
-                    count_t++;
-                }
-            } else {
-                if (remove_ws) out << removeExtraChars(line);
-                else out << line << "\n";
-                count_t++;
-                while (getline(in, line) && line != "world") {
-                    if (remove_ws) out << removeExtraChars(line);
-                    else out << line << "\n";
-                    count_t++;
-                }
-            }
-            if (remove_ws) out << removeExtraChars(line);
-            else out << line << "\n";
-            count_t++;
-            while (getline(in, line) && line !=
-                                        "entity") {//scans the world brushes (which are all before entities), should be faster than the next cycle
-                if (line.find("vertices_plus") != string::npos && remove_vertplus) {//if "vertices_plus" is found
-                    while (line.find("material") == string::npos && getline(in, line)) {
-                        count_t++;
-                        count_r++;
-                    }
-                    if (remove_ws) out << removeExtraChars(line);
-                    else out << line << "\n";
-                    count_t++;
-                }//lightmaps are not being erased, since the default lightmap value can be changed
-                else if (line.find("rotation\" \"0") == string::npos &&
-                         line.find("smoothing_groups\" \"0") == string::npos &&
-                         line.find("elevation\" \"0") == string::npos &&
-                         line.find("subdiv\" \"0") == string::npos) {
-                    if (remove_ws) out << removeExtraChars(line);
-                    else out << line << "\n";
-                } else count_r++;
-                count_t++;
-            }
-            if (remove_ws) out << removeExtraChars(line);
-            else out << line << "\n";
-            count_t++;
-            if (verbose) {
-                cout << "\nWorld brushes finished on line " << count_t << ".\n\n";
-                if (savelog) log << "\nWorld brushes finished on line " << count_t << ".\n\n";
-            }
-            while (getline(in, line)) {//yandere dev moment
-                if (line.length() > 4) {
-                    if (line.find("classname") == string::npos &&
-                        line.find("vertices_plus") ==
-                        string::npos) {//originally there was find("name") to not corrupt the vmf if some dumbass decides to name their prop "angles 0 0 0", but you can't use quotes without corruption anyway.
-                        switch (type) {
-                            case 0:
-                                if (remove_ws) out << removeExtraChars(line);
-                                else out << line << "\n";
-                                break;
-                            case 1://prop_static
-                                if (line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("fademaxdist\" \"0") == string::npos &&
-                                    line.find("fademindist\" \"-1") == string::npos &&
-                                    line.find("fadescale\" \"1") == string::npos &&
-                                    line.find("lightmapresolutionx\" \"32") == string::npos &&//i could probably
-                                    line.find("lightmapresolutiony\" \"32") == string::npos &&//merge these two
-                                    line.find("skin\" \"0") == string::npos &&
-                                    line.find("solid\" \"6") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 2://prop_dynamic
-                                if (line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("DisableBoneFollowers\" \"0") == string::npos &&
-                                    line.find("shadows\" \"0") == string::npos &&
-                                    //removes both disableshadows and disablereceiveshadows
-                                    line.find("ExplodeDamage\" \"0") == string::npos &&
-                                    line.find("ExplodeRadius\" \"0") == string::npos &&
-                                    line.find("fademaxdist\" \"0") == string::npos &&
-                                    line.find("fademindist\" \"-1") == string::npos &&
-                                    line.find("fadescale\" \"1") == string::npos &&
-                                    line.find("MaxAnimTime\" \"10") == string::npos &&
-                                    line.find("MinAnimTime\" \"5") == string::npos &&
-                                    line.find("modelscale\" \"1.0") == string::npos &&
-                                    line.find("PerformanceMode\" \"0") == string::npos &&
-                                    line.find("pressuredelay\" \"0") == string::npos &&
-                                    line.find("RandomAnimation\" \"0") == string::npos &&
-                                    line.find("renderamt\" \"255") == string::npos &&
-                                    line.find("rendercolor\" \"255 255 255") == string::npos &&
-                                    line.find("renderfx\" \"0") == string::npos &&
-                                    line.find("rendermode\" \"0") == string::npos &&
-                                    line.find("SetBodyGroup\" \"0") == string::npos &&
-                                    line.find("skin\" \"0") == string::npos &&
-                                    line.find("solid\" \"6") == string::npos &&
-                                    line.find("StartDisabled\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 3://prop_physics
-                                if (line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("damagetoenablemotion\" \"0") == string::npos &&
-                                    line.find("Damagetype\" \"0") == string::npos &&
-                                    line.find("shadows\" \"0") == string::npos &&
-                                    line.find("ExplodeDamage\" \"0") == string::npos &&
-                                    line.find("ExplodeRadius\" \"0") == string::npos &&
-                                    line.find("fademaxdist\" \"0") == string::npos &&
-                                    line.find("fademindist\" \"-1") == string::npos &&
-                                    line.find("fadescale\" \"1") == string::npos &&
-                                    line.find("forcetoenablemotion\" \"0") == string::npos &&
-                                    line.find("inertiaScale\" \"1.0") == string::npos &&
-                                    line.find("massScale\" \"0") == string::npos &&
-                                    line.find("minhealthdmg\" \"0") == string::npos &&
-                                    line.find("modelscale\" \"1.0") == string::npos &&
-                                    line.find("nodamageforces\" \"0") == string::npos &&
-                                    line.find("PerformanceMode\" \"0") == string::npos &&
-                                    line.find("physdamagescale\" \"0.1") == string::npos &&
-                                    line.find("pressuredelay\" \"0") == string::npos &&
-                                    line.find("renderamt\" \"255") == string::npos &&
-                                    line.find("rendercolor\" \"255 255 255") == string::npos &&
-                                    line.find("renderfx\" \"0") == string::npos &&
-                                    line.find("rendermode\" \"0") == string::npos &&
-                                    line.find("shadowcastdist\" \"0") == string::npos &&
-                                    line.find("skin\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 4://func_detail
-                                if (line.find("dxlevel\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 5://func_brush
-                                if (line.find("InputFilter\" \"0") == string::npos &&
-                                    line.find("invert_exclusion\" \"0") == string::npos &&
-                                    line.find("renderamt\" \"255") == string::npos &&
-                                    line.find("rendercolor\" \"255 255 255") == string::npos &&
-                                    line.find("renderfx\" \"0") == string::npos &&
-                                    line.find("rendermode\" \"0") == string::npos &&
-                                    line.find("solidbsp\" \"0") == string::npos &&
-                                    line.find("Solidity\" \"0") == string::npos &&
-                                    line.find("StartDisabled") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 6://light: since light and light_spot have some identical parameter names, i wanted to merge them for efficiency (case 7: case 6: break;), but my code shat itself, so yeah
-                                if (line.find("_constant_attn\" \"0") == string::npos &&
-                                    line.find("_distance\" \"0") == string::npos &&
-                                    line.find("_fifty_percent_distance\" \"0") == string::npos &&
-                                    line.find("_hardfalloff\" \"0") == string::npos &&
-                                    line.find("_light\" \"255 255 255 200") == string::npos &&
-                                    line.find("_lightHDR\" \"-1 -1 -1 1") == string::npos &&
-                                    line.find("_lightscaleHDR\" \"1") == string::npos &&
-                                    line.find("_linear_attn\" \"0") == string::npos &&
-                                    line.find("_quadratic_attn\" \"1") == string::npos &&
-                                    line.find("_zero_percent_distance\" \"0") == string::npos &&
-                                    line.find("style\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 7://light_spot
-                                if (line.find("_constant_attn\" \"0") == string::npos &&
-                                    line.find("_distance\" \"0") == string::npos &&
-                                    line.find("_fifty_percent_distance\" \"0") == string::npos &&
-                                    line.find("_hardfalloff\" \"0") == string::npos &&
-                                    line.find("_light\" \"255 255 255 200") == string::npos &&
-                                    line.find("_lightHDR\" \"-1 -1 -1 1") == string::npos &&
-                                    line.find("_lightscaleHDR\" \"1") == string::npos &&
-                                    line.find("_linear_attn\" \"0") == string::npos &&
-                                    line.find("_quadratic_attn\" \"1") == string::npos &&
-                                    line.find("_zero_percent_distance\" \"0") == string::npos &&
-                                    line.find("style\" \"0") == string::npos &&
-                                    line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("_cone\" \"45") == string::npos &&
-                                    line.find("_exponent\" \"1") == string::npos &&
-                                    line.find("_inner_cone\" \"30") == string::npos &&
-                                    line.find("pitch\" \"-90") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 8://light_dynamic
-                                if (line.find("style\" \"0") == string::npos &&
-                                    line.find("_cone\" \"45") == string::npos &&
-                                    line.find("_inner_cone\" \"30") == string::npos &&
-                                    line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("brightness\" \"0") == string::npos &&
-                                    line.find("distance\" \"120") == string::npos &&
-                                    line.find("spotlight_radius\" \"80") == string::npos &&
-                                    line.find("pitch\" \"-90") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 9://func_door
-                                if (line.find("shadows\" \"0") == string::npos &&
-                                    line.find("dmg\" \"0") == string::npos &&
-                                    line.find("forceclosed\" \"0") == string::npos &&
-                                    line.find("health\" \"0") == string::npos &&
-                                    line.find("ignoredebris\" \"0") == string::npos &&
-                                    line.find("lip\" \"0") == string::npos &&
-                                    line.find("locked_sentence\" \"0") == string::npos &&
-                                    line.find("loopmovesound\" \"0") == string::npos &&
-                                    line.find("movedir\" \"0 0 0") == string::npos &&
-                                    line.find("renderamt\" \"255") == string::npos &&
-                                    line.find("rendercolor\" \"255 255 255") == string::npos &&
-                                    line.find("renderfx\" \"0") == string::npos &&
-                                    line.find("rendermode\" \"0") == string::npos &&
-                                    line.find("speed\" \"100") == string::npos &&
-                                    line.find("unlocked_sentence\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 10://info_decal
-                                if (line.find("angles\" \"0 0 0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 11://info_overlay
-                                if (line.find("fademaxdist\" \"0") == string::npos &&
-                                    line.find("fademindist\" \"-1") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 12://trigger_once, trigger_remove, other triggers
-                                if (line.find("StartDisabled\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 13://trigger_multiple
-                                if (line.find("StartDisabled\" \"0") == string::npos &&
-                                    line.find("wait\" \"1") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 14://trigger_hurt
-                                if (line.find("StartDisabled\" \"0") == string::npos &&
-                                    line.find("damagemodel\" \"0") == string::npos &&
-                                    line.find("damagetype\" \"0") == string::npos &&
-                                    line.find("nodmgforce\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 15://func_areaportal
-                                if (line.find("PortalVersion\" \"1") == string::npos &&
-                                    line.find("StartOpen\" \"1") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 16://func_areaportal_window
-                                if (line.find("PortalVersion\" \"1") == string::npos &&
-                                    line.find("TranslucencyLimit\" \"0.2") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 17://ambient_generic
-                                if (line.find("cspinup\" \"0") == string::npos &&
-                                    line.find("secs\" \"0") == string::npos &&//both fadeinsecs and fadeoutsecs
-                                    line.find("health\" \"10") == string::npos &&
-                                    line.find("lfomodpitch\" \"0") == string::npos &&
-                                    line.find("lfomodvol\" \"0") == string::npos &&
-                                    line.find("lforate\" \"0") == string::npos &&
-                                    line.find("lfotype\" \"0") == string::npos &&
-                                    line.find("pitch\" \"100") == string::npos &&
-                                    line.find("pitchstart\" \"100") == string::npos &&
-                                    line.find("preset\" \"0") == string::npos &&
-                                    line.find("radius\" \"1250") == string::npos &&
-                                    line.find("spindown\" \"0") == string::npos &&
-                                    line.find("spinup\" \"0") == string::npos &&
-                                    line.find("volstart\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 18://brush entities
-                                if (line.find("rotation\" \"0") == string::npos &&
-                                    line.find("smoothing_groups\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 19://light_environment
-                                if (line.find("_ambient\" \"255 255 255 20") == string::npos &&
-                                    line.find("_light\" \"255 255 255 200") == string::npos &&
-                                    line.find("HDR\" \"-1 -1 -1 1") == string::npos &&//both normal and ambient
-                                    line.find("caleHDR\" \"1") == string::npos &&//both
-                                    line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("_inner_cone\" \"30") == string::npos &&
-                                    line.find("pitch\" \"0") == string::npos &&
-                                    line.find("SunSpreadAngle\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 20://item_
-                                if (line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("AutoMaterialize\" \"1") == string::npos &&
-                                    line.find("fademaxdist\" \"0") == string::npos &&
-                                    line.find("fademindist\" \"-1") == string::npos &&
-                                    line.find("StartDisabled\" \"0") == string::npos &&
-                                    line.find("TeamNum\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 21://ropes
-                                if (line.find("Barbed\" \"0") == string::npos &&
-                                    line.find("Breakable\" \"0") == string::npos &&
-                                    line.find("Collide\" \"0") == string::npos &&
-                                    line.find("Dangling\" \"-1") == string::npos &&
-                                    line.find("dxlevel\" \"0") == string::npos &&
-                                    line.find("NoWind\" \"0") == string::npos &&
-                                    line.find(R"(RopeMaterial" "cable/cable.vmt")") == string::npos &&
-                                    line.find("Slack\" \"25") == string::npos &&
-                                    line.find("Subdiv\" \"2") == string::npos &&
-                                    line.find("TextureScale\" \"1") == string::npos &&
-                                    line.find("Type\" \"0") == string::npos &&
-                                    line.find("Width\" \"2") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 22://info_particle_system
-                                if (line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("parent\" \"0") == string::npos &&
-                                    line.find("flag_as_weather\" \"0") == string::npos &&
-                                    line.find("start_active\" \"0") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 23://point_spotlight
-                                if (line.find("angles\" \"0 0 0") == string::npos &&
-                                    line.find("disablereceiveshadows\" \"0") == string::npos &&
-                                    line.find("HDRColorScale\" \"1.0") == string::npos &&
-                                    line.find("IgnoreSolid\" \"0") == string::npos &&
-                                    line.find("dxlevel\" \"0") == string::npos &&
-                                    line.find("renderamt\" \"255") == string::npos &&
-                                    line.find("rendercolor\" \"255 255 255") == string::npos &&
-                                    line.find("renderfx\" \"0") == string::npos &&
-                                    line.find("rendermode\" \"0") == string::npos &&
-                                    line.find("spotlightlength\" \"500") == string::npos &&
-                                    line.find("spotlightwidth\" \"50") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            case 24://editor_text
-                                if (line.find("angles\" \"-0 0 0") == string::npos &&
-                                    line.find("color\" \"255 255 255") == string::npos &&
-                                    line.find("textsize\" \"10") == string::npos) {
-                                    if (remove_ws) out << removeExtraChars(line);
-                                    else out << line << "\n";
-                                } else count_r++;
-                                break;
-                            default:
-                                if (remove_ws) out << removeExtraChars(line);
-                                else out << line << "\n";
-                                break;
+        else if (state == SOLID)
+        {
+            if (process_solids)
+            {
+                if (remove_vplus)
+                {
+                    if (gate == 0)
+                    {
+                        if (contains(line_low, "\"vertices_plus\""))
+                        {
+                            VER("INFO:  Removed vertices_plus at line: %d\n", count_i + 1);
+                            gate = 1;
+                            goto NEXT;
                         }
-                    } else if (line.find("classname") != string::npos) {//if "classname" is found
-                        if (line.find("\"prop_") != string::npos) {
-                            if (line.find("static") != string::npos) type = 1;
-                            else if (line.find("dynamic") != string::npos) type = 2;//also affects prop_dynamic_override
-                            else type = 3;//physics, also affects prop_physics_override, detail and other misc prop objects
-                        } else if (line.find("\"func_") != string::npos) {
-                            if (line.find("detail") != string::npos) type = 4;
-                            else if (line.find("brush") != string::npos) type = 5;
-                            else if (line.find("door") != string::npos) type = 9;//both normal and rotating
-                            else if (line.find("areaportal") != string::npos) {
-                                if (line.find("window\"") != string::npos) type = 16;//areaportal_window
-                                else type = 15;//areaportal
-                            } else type = 0;
-                        } else if (line.find("\"light") != string::npos) {
-                            if (line.find("spot") != string::npos) type = 7;//light_spot
-                            else if (line.find("dynamic") != string::npos) type = 8;//light_dynamic
-                            else if (line.find("environment") != string::npos) type = 19;//light_environment
-                            else type = 6;//light
-                        } else if (line.find("\"info_") != string::npos) {
-                            if (line.find("decal") != string::npos) type = 10;
-                            else if (line.find("overlay") != string::npos) type = 11;
-                            else if (line.find("particle") != string::npos) type = 22;
-                            else type = 0;
-                        } else if (line.find("\"trigger") != string::npos) {
-                            if (line.find("multiple") != string::npos)
-                                type = 13;//multiple goes first because it's the most frequent
-                            else if (line.find("hurt") != string::npos) type = 14;
-                            else type = 12;
-                        } else if (line.find("\"ambient_generic") != string::npos) type = 17;
-                        else if (line.find("\"item_") != string::npos) type = 20;
-                        else if (line.find("rope\"") != string::npos) type = 21;
-                        else if (line.find("\"point_spotlight") != string::npos) type = 23;
-                        else if (line.find("\"editor") != string::npos) type = 24;
-                        else type = 0;
-                        if (remove_ws) out << removeExtraChars(line);
-                        else out << line << "\n";
-                    } else if (line.find("vertices_plus") != string::npos) {//if "vertices_plus" is found
-                        if (remove_vertplus) {
-                            while (line.find("material") == string::npos && getline(in, line)) {
-                                count_t++;
-                                count_r++;
+                    }
+                    else
+                    {
+                        if (line_raw == "}")
+                        {
+                            if (--gate == 1) gate = 0;
+                            goto NEXT;
+                        }
+                        else if (line_raw == "{")
+                        {
+                            gate++;
+                            goto NEXT;
+                        }
+                    }
+                }
+                else
+                {
+                    // Clear zero values
+                    if (contains(line_low, "\"smoothing_groups\" \"0\"") ||
+                        contains(line_low, "\"rotation\" \"0\"") ||
+                        contains(line_low, "\"elevation\" \"0\"") ||
+                        contains(line_low, "\"subdiv\" \"0\""))
+                        goto NEXT;
+                }
+            }
+
+            // To the next state
+            if (line_raw == "entity")
+            {
+                VER("INFO:  Found entity chunk at line: %d\n", count_i + 1);
+                pos = in.tellg();
+                state = ENTITY;
+            }
+        }
+        else if (state == ENTITY)
+        {
+            if (process_entities)
+            {
+                // Find the classname of the entity
+                if (contains(line_low, "classname"))
+                {
+                    if (contains(line_low, "\"prop_"))
+                    {
+                        if (contains(line_low, "static"))
+                        {
+                            VER("INFO:  Found prop_static at line: %d\n", count_i + 1);
+                            type = PROP_STATIC;
+                        }
+                        else if (contains(line_low, "dynamic"))
+                        {
+                            VER("INFO:  Found prop_dynamic-like at line: %d\n", count_i + 1);
+                            type = PROP_DYNAMIC; // Also affects prop_dynamic_override
+                        }
+                        else
+                        {
+                            VER("INFO:  Found prop at line: %d\n", count_i + 1);
+                            type = PROP_OTHER;
+                        }
+                    }
+                    else if (contains(line_low, "\"func_"))
+                    {
+                        if (contains(line_low, "detail"))
+                        {
+                            VER("INFO:  Found func_detail at line: %d\n", count_i + 1);
+                            type = FUNC_DETAIL;
+                        }
+                        else if (contains(line_low, "brush"))
+                        {
+                            VER("INFO:  Found func_brush at line: %d\n", count_i + 1);
+                            type = FUNC_BRUSH;
+                        }
+                        else if (contains(line_low, "door"))
+                        {
+                            VER("INFO:  Found func_door-like at line: %d\n", count_i + 1);
+                            type = FUNC_DOOR; // Both normal and rotating
+                        }
+                        else if (contains(line_low, "areaportal"))
+                        {
+                            if (contains(line_low, "window\""))
+                            {
+                                VER("INFO:  Found func_areaportalwindow at line: %d\n", count_i + 1);
+                                type = FUNC_AREAPORTALWINDOW;
+                            }
+                            else
+                            {
+                                VER("INFO:  Found func_areaportal at line: %d\n", count_i + 1);
+                                type = FUNC_AREAPORTAL;
                             }
                         }
-                        type = 18;
-                        if (remove_ws) out << removeExtraChars(line);
-                        else out << line << "\n";
+                        else type = NONE;
                     }
-                }//if the line is <5 letters long
-                else {
-                    if (remove_ws) out << removeExtraChars(line);
-                    else out << line << "\n";
+                    else if (contains(line_low, "\"light"))
+                    {
+                        if (contains(line_low, "spot"))
+                        {
+                            VER("INFO:  Found light_spot at line: %d\n", count_i + 1);
+                            type = LIGHT_SPOT;
+                        }
+                        else if (contains(line_low, "dynamic"))
+                        {
+                            VER("INFO:  Found light_dynamic at line: %d\n", count_i + 1);
+                            type = LIGHT_DYNAMIC;
+                        }
+                        else if (contains(line_low, "environment"))
+                        {
+                            VER("INFO:  Found light_environment at line: %d\n", count_i + 1);
+                            type = LIGHT_ENVIRONMENT;
+                        }
+                        else
+                        {
+                            VER("INFO:  Found light at line: %d\n", count_i + 1);
+                            type = LIGHT;
+                        }
+                    }
+                    else if (contains(line_low, "\"info_"))
+                    {
+                        if (contains(line_low, "decal"))
+                        {
+                            VER("INFO:  Found info_decal at line: %d\n", count_i + 1);
+                            type = INFO_DECAL;
+                        }
+                        else if (contains(line_low, "overlay"))
+                        {
+                            VER("INFO:  Found info_overlay at line: %d\n", count_i + 1);
+                            type = INFO_OVERLAY;
+                        }
+                        else if (contains(line_low, "particle"))
+                        {
+                            VER("INFO:  Found info_particle_system at line: %d\n", count_i + 1);
+                            type = INFO_PARTICLE_SYSTEM;
+                        }
+                        else type = NONE;
+                    }
+                    else if (contains(line_low, "\"trigger"))
+                    {
+                        if (contains(line_low, "multiple"))
+                        {
+                            VER("INFO:  Found trigger_multiple at line: %d\n", count_i + 1);
+                            type = TRIGGER_MULTIPLE; // Multiple goes first because it's the most frequent
+                        }
+                        else if (contains(line_low, "hurt"))
+                        {
+                            VER("INFO:  Found trigger_hurt at line: %d\n", count_i + 1);
+                            type = TRIGGER_HURT;
+                        }
+                        else
+                        {
+                            VER("INFO:  Found trigger at line: %d\n", count_i + 1);
+                            type = TRIGGER_ONCE;
+                        }
+                    }
+                    else if (contains(line_low, "\"ambient_generic"))
+                    {
+                        VER("INFO:  Found ambient_generic at line: %d\n", count_i + 1);
+                        type = AMBIENT_GENERIC;
+                    }
+                    else if (contains(line_low, "\"item_"))
+                    {
+                        VER("INFO:  Found item at line: %d\n", count_i + 1);
+                        type = ITEM_PACK;
+                    }
+                    else if (contains(line_low, "rope\""))
+                    {
+                        VER("INFO:  Found rope at line: %d\n", count_i + 1);
+                        type = MOVE_ROPE;
+                    }
+                    else if (contains(line_low, "\"point_spotlight"))
+                    {
+                        VER("INFO:  Found point_spotlight at line: %d\n", count_i + 1);
+                        type = POINT_SPOTLIGHT;
+                    }
+                    else if (contains(line_low, "\"editor"))
+                    {
+                        VER("INFO:  Found editor at line: %d\n", count_i + 1);
+                        type = EDITOR;
+                    }
+                    else type = NONE;
+                    state = CLASS;
+
+                    // Rewind to the entity definition
+                    in.seekg(pos);
                 }
-                count_t++;
+                else if (contains(line_low, "vertices_plus"))
+                {
+                    type = BRUSH_ENTITIES;
+                    state = CLASS;
+
+                    // Rewind to the entity definition
+                    in.seekg(pos);
+                }
+
+                // Don't process the lines when checking classnames
+                continue;
             }
-            in.close();
-            out.close();
-            auto timeend = std::chrono::high_resolution_clock::now();
-            auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(timeend - timestart);
-            cout << "Finished file " << filename << ".\nRemoved " << count_r << " out of " << count_t << " lines. ("
-                 << (float) count_r / (float) count_t * 100
-                 << "%)\nTime elapsed: " << milliseconds.count()
-                 << " ms\n\nPress ENTER to finish program. If you wish to continue, drop another file here or type file name:\n";
-            if (savelog)
-                log << "Finished file " << filename << ".\nRemoved " << count_r << " out of " << count_t << " lines. ("
-                    << (float) count_r / (float) count_t * 100 << "%)\nTime elapsed: " << milliseconds.count()
-                    << " ms\n\n";
-            filecount++;
-            count_r_all = count_r_all + count_r;
-            count_t_all = count_t_all + count_t;
         }
-        getline(std::cin, filename);
+        else
+        {
+            // Clear default values
+            switch (type)
+            {
+                case PROP_STATIC:
+                    if (contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "fademaxdist\" \"0") ||
+                        contains(line_low, "fademindist\" \"-1") ||
+                        contains(line_low, "fadescale\" \"1") ||
+                        contains(line_low, "lightmapresolutionx\" \"32") ||
+                        contains(line_low, "lightmapresolutiony\" \"32") ||
+                        contains(line_low, "skin\" \"0") ||
+                        contains(line_low, "solid\" \"6"))
+                        goto NEXT;
+                    break;
+                case PROP_DYNAMIC:
+                    if (contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "disablebonefollowers\" \"0") ||
+                        contains(line_low, "shadows\" \"0") ||
+                        contains(line_low, "explodedamage\" \"0") ||
+                        contains(line_low, "exploderadius\" \"0") ||
+                        contains(line_low, "fademaxdist\" \"0") ||
+                        contains(line_low, "fademindist\" \"-1") ||
+                        contains(line_low, "fadescale\" \"1") ||
+                        contains(line_low, "maxanimtime\" \"10") ||
+                        contains(line_low, "minanimtime\" \"5") ||
+                        contains(line_low, "modelscale\" \"1.0") ||
+                        contains(line_low, "performancemode\" \"0") ||
+                        contains(line_low, "pressuredelay\" \"0") ||
+                        contains(line_low, "randomanimation\" \"0") ||
+                        contains(line_low, "renderamt\" \"255") ||
+                        contains(line_low, "rendercolor\" \"255 255 255") ||
+                        contains(line_low, "renderfx\" \"0") ||
+                        contains(line_low, "rendermode\" \"0") ||
+                        contains(line_low, "setbodygroup\" \"0") ||
+                        contains(line_low, "skin\" \"0") ||
+                        contains(line_low, "solid\" \"6") ||
+                        contains(line_low, "startdisabled\" \"0"))
+                        goto NEXT;
+                    break;
+                case PROP_OTHER:
+                    if (contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "damagetoenablemotion\" \"0") ||
+                        contains(line_low, "damagetype\" \"0") ||
+                        contains(line_low, "shadows\" \"0") ||
+                        contains(line_low, "explodedamage\" \"0") ||
+                        contains(line_low, "exploderadius\" \"0") ||
+                        contains(line_low, "fademaxdist\" \"0") ||
+                        contains(line_low, "fademindist\" \"-1") ||
+                        contains(line_low, "fadescale\" \"1") ||
+                        contains(line_low, "forcetoenablemotion\" \"0") ||
+                        contains(line_low, "inertiascale\" \"1.0") ||
+                        contains(line_low, "massscale\" \"0") ||
+                        contains(line_low, "minhealthdmg\" \"0") ||
+                        contains(line_low, "modelscale\" \"1.0") ||
+                        contains(line_low, "nodamageforces\" \"0") ||
+                        contains(line_low, "performancemode\" \"0") ||
+                        contains(line_low, "physdamagescale\" \"0.1") ||
+                        contains(line_low, "pressuredelay\" \"0") ||
+                        contains(line_low, "renderamt\" \"255") ||
+                        contains(line_low, "rendercolor\" \"255 255 255") ||
+                        contains(line_low, "renderfx\" \"0") ||
+                        contains(line_low, "rendermode\" \"0") ||
+                        contains(line_low, "shadowcastdist\" \"0") ||
+                        contains(line_low, "skin\" \"0"))
+                        goto NEXT;
+                    break;
+                case FUNC_BRUSH:
+                    if (contains(line_low, "inputfilter\" \"0") ||
+                        contains(line_low, "invert_exclusion\" \"0") ||
+                        contains(line_low, "renderamt\" \"255") ||
+                        contains(line_low, "rendercolor\" \"255 255 255") ||
+                        contains(line_low, "renderfx\" \"0") ||
+                        contains(line_low, "rendermode\" \"0") ||
+                        contains(line_low, "solidbsp\" \"0") ||
+                        contains(line_low, "solidity\" \"0") ||
+                        contains(line_low, "startdisabled"))
+                        goto NEXT;
+                    break;
+                case FUNC_DETAIL:
+                    if (contains(line_low, "dxlevel\" \"0"))
+                        goto NEXT;
+                    break;
+                case FUNC_DOOR:
+                    if (contains(line_low, "shadows\" \"0") ||
+                        contains(line_low, "dmg\" \"0") ||
+                        contains(line_low, "forceclosed\" \"0") ||
+                        contains(line_low, "health\" \"0") ||
+                        contains(line_low, "ignoredebris\" \"0") ||
+                        contains(line_low, "lip\" \"0") ||
+                        contains(line_low, "locked_sentence\" \"0") ||
+                        contains(line_low, "loopmovesound\" \"0") ||
+                        contains(line_low, "movedir\" \"0 0 0") ||
+                        contains(line_low, "renderamt\" \"255") ||
+                        contains(line_low, "rendercolor\" \"255 255 255") ||
+                        contains(line_low, "renderfx\" \"0") ||
+                        contains(line_low, "rendermode\" \"0") ||
+                        contains(line_low, "speed\" \"100") ||
+                        contains(line_low, "unlocked_sentence\" \"0"))
+                        goto NEXT;
+                    break;
+                case FUNC_AREAPORTAL:
+                    if (contains(line_low, "portalversion\" \"1") ||
+                        contains(line_low, "startopen\" \"1"))
+                        goto NEXT;
+                    break;
+                case FUNC_AREAPORTALWINDOW:
+                    if (contains(line_low, "portalversion\" \"1") ||
+                        contains(line_low, "translucencylimit\" \"0.2"))
+                        goto NEXT;
+                    break;
+                case LIGHT_SPOT:
+                    if (contains(line_low, "style\" \"0") ||
+                        contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "_cone\" \"45") ||
+                        contains(line_low, "_exponent\" \"1") ||
+                        contains(line_low, "_inner_cone\" \"30") ||
+                        contains(line_low, "pitch\" \"-90"))
+                        goto NEXT;
+                case LIGHT:
+                    if (contains(line_low, "_constant_attn\" \"0") ||
+                        contains(line_low, "_distance\" \"0") ||
+                        contains(line_low, "_fifty_percent_distance\" \"0") ||
+                        contains(line_low, "_hardfalloff\" \"0") ||
+                        contains(line_low, "_light\" \"255 255 255 200") ||
+                        contains(line_low, "_lighthdr\" \"-1 -1 -1 1") ||
+                        contains(line_low, "_lightscalehdr\" \"1") ||
+                        contains(line_low, "_linear_attn\" \"0") ||
+                        contains(line_low, "_quadratic_attn\" \"1") ||
+                        contains(line_low, "_zero_percent_distance\" \"0") ||
+                        contains(line_low, "style\" \"0"))
+                        goto NEXT;
+                    break;
+                case LIGHT_DYNAMIC:
+                    if (contains(line_low, "style\" \"0") ||
+                        contains(line_low, "_cone\" \"45") ||
+                        contains(line_low, "_inner_cone\" \"30") ||
+                        contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "brightness\" \"0") ||
+                        contains(line_low, "distance\" \"120") ||
+                        contains(line_low, "spotlight_radius\" \"80") ||
+                        contains(line_low, "pitch\" \"-90"))
+                        goto NEXT;
+                    break;
+                case LIGHT_ENVIRONMENT:
+                    if (contains(line_low, "_ambient\" \"255 255 255 20") ||
+                        contains(line_low, "_light\" \"255 255 255 200") ||
+                        contains(line_low, "hdr\" \"-1 -1 -1 1") ||
+                        contains(line_low, "calehdr\" \"1") ||
+                        contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "_inner_cone\" \"30") ||
+                        contains(line_low, "pitch\" \"0") ||
+                        contains(line_low, "sunspreadangle\" \"0"))
+                        goto NEXT;
+                    break;
+                case INFO_DECAL:
+                    if (contains(line_low, "angles\" \"0 0 0"))
+                        goto NEXT;
+                    break;
+                case INFO_OVERLAY:
+                    if (contains(line_low, "fademaxdist\" \"0") ||
+                        contains(line_low, "fademindist\" \"-1"))
+                        goto NEXT;
+                    break;
+                case INFO_PARTICLE_SYSTEM:
+                    if (contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "parent\" \"0") ||
+                        contains(line_low, "flag_as_weather\" \"0") ||
+                        contains(line_low, "start_active\" \"0"))
+                        goto NEXT;
+                    break;
+                case TRIGGER_ONCE:
+                    if (contains(line_low, "startdisabled\" \"0"))
+                        goto NEXT;
+                    break;
+                case TRIGGER_MULTIPLE:
+                    if (contains(line_low, "startdisabled\" \"0") ||
+                        contains(line_low, "wait\" \"1"))
+                        goto NEXT;
+                    break;
+                case TRIGGER_HURT:
+                    if (contains(line_low, "startdisabled\" \"0") ||
+                        contains(line_low, "damagemodel\" \"0") ||
+                        contains(line_low, "damagetype\" \"0") ||
+                        contains(line_low, "nodmgforce\" \"0"))
+                        goto NEXT;
+                    break;
+                case AMBIENT_GENERIC:
+                    if (contains(line_low, "cspinup\" \"0") ||
+                        contains(line_low, "secs\" \"0") ||
+                        contains(line_low, "health\" \"10") ||
+                        contains(line_low, "lfomodpitch\" \"0") ||
+                        contains(line_low, "lfomodvol\" \"0") ||
+                        contains(line_low, "lforate\" \"0") ||
+                        contains(line_low, "lfotype\" \"0") ||
+                        contains(line_low, "pitch\" \"100") ||
+                        contains(line_low, "pitchstart\" \"100") ||
+                        contains(line_low, "preset\" \"0") ||
+                        contains(line_low, "radius\" \"1250") ||
+                        contains(line_low, "spindown\" \"0") ||
+                        contains(line_low, "spinup\" \"0") ||
+                        contains(line_low, "volstart\" \"0"))
+                        goto NEXT;
+                    break;
+                case ITEM_PACK:
+                    if (contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "automaterialize\" \"1") ||
+                        contains(line_low, "fademaxdist\" \"0") ||
+                        contains(line_low, "fademindist\" \"-1") ||
+                        contains(line_low, "startdisabled\" \"0") ||
+                        contains(line_low, "teamnum\" \"0"))
+                        goto NEXT;
+                    break;
+                case MOVE_ROPE:
+                    if (contains(line_low, "barbed\" \"0") ||
+                        contains(line_low, "breakable\" \"0") ||
+                        contains(line_low, "collide\" \"0") ||
+                        contains(line_low, "dangling\" \"-1") ||
+                        contains(line_low, "dxlevel\" \"0") ||
+                        contains(line_low, "nowind\" \"0") ||
+                        contains(line_low, "slack\" \"25") ||
+                        contains(line_low, "subdiv\" \"2") ||
+                        contains(line_low, "texturescale\" \"1") ||
+                        contains(line_low, "type\" \"0") ||
+                        contains(line_low, "width\" \"2") ||
+                        line_base.find(R"(RopeMaterial" "cable/cable.vmt")") != string::npos)
+                        goto NEXT;
+                    break;
+                case BRUSH_ENTITIES:
+                    if (contains(line_low, "rotation\" \"0") ||
+                        contains(line_low, "smoothing_groups\" \"0"))
+                        goto NEXT;
+                    break;
+                case POINT_SPOTLIGHT:
+                    if (contains(line_low, "angles\" \"0 0 0") ||
+                        contains(line_low, "disablereceiveshadows\" \"0") ||
+                        contains(line_low, "hdrcolorscale\" \"1.0") ||
+                        contains(line_low, "ignoresolid\" \"0") ||
+                        contains(line_low, "dxlevel\" \"0") ||
+                        contains(line_low, "renderamt\" \"255") ||
+                        contains(line_low, "rendercolor\" \"255 255 255") ||
+                        contains(line_low, "renderfx\" \"0") ||
+                        contains(line_low, "rendermode\" \"0") ||
+                        contains(line_low, "spotlightlength\" \"500") ||
+                        contains(line_low, "spotlightwidth\" \"50"))
+                        goto NEXT;
+                    break;
+                case EDITOR:
+                    if (contains(line_low, "angles\" \"-0 0 0") ||
+                        contains(line_low, "color\" \"255 255 255") ||
+                        contains(line_low, "textsize\" \"10"))
+                        goto NEXT;
+                    break;
+            }
+
+            if (remove_vplus)
+            {
+                if (gate == 0)
+                {
+                    if (contains(line_low, "\"vertices_plus\""))
+                    {
+                        VER("INFO:  Removed vertices_plus at line: %d\n", count_i + 1);
+                        gate = 1;
+                        goto NEXT;
+                    }
+                }
+                else
+                {
+                    if (line_raw == "}")
+                    {
+                        if (--gate == 1) gate = 0;
+                        goto NEXT;
+                    }
+                    else if (line_raw == "{")
+                    {
+                        gate++;
+                        goto NEXT;
+                    }
+                }
+            }
+
+            // To the next state
+            if (line_raw == "entity")
+            {
+                VER("INFO:  Found entity chunk at line: %d\n", count_i + 1);
+                pos = in.tellg();
+                state = ENTITY;
+            }
+        }
+
+        // Clear some editor infos useless for prefabs
+        if (isprefab)
+        {
+            if (gate == 0)
+            {
+                if (line_raw == "editor" ||
+                    line_raw == "viewsettings" ||
+                    line_raw == "visgroups" ||
+                    line_raw == "cameras" ||
+                    line_raw == "cordons")
+                {
+                    gate = 1;
+                    goto NEXT;
+                }
+            }
+            else
+            {
+                if (line_raw == "}")
+                {
+                    if (--gate == 1) gate = 0;
+                    goto NEXT;
+                }
+                else if (line_raw == "{")
+                {
+                    gate++;
+                    goto NEXT;
+                }
+            }
+        }
+
+      WRITE:
+        // Gate control
+        if (gate > 0)
+            goto NEXT;
+
+        // Write the line (stripped)
+        if (strip_ws) out << remove_whitespaces(line_base);
+        else out << line_base;
+        if (!carriages) out << "\n";
+        else out << "\r\n";
+        count_o++;
+      NEXT:
+        count_i++;
     }
-    cout<<"\nSuccessful compression of "<<filecount<<" files.\nRemoved " << count_r_all << " out of " << count_t_all << " total lines. ("<< (float) count_r_all / (float) count_t_all * 100 << "%)\n\n";
-    if (savelog){log<<"\nSuccessful compression of "<<filecount<<" files.\nRemoved " << count_r_all << " out of " << count_t_all << " total lines. ("<< (float) count_r_all / (float) count_t_all * 100 << "%)";
-    log.close();}
-    system("pause");
+
+    // Compute the elapsed time
+    auto timeend = chrono::high_resolution_clock::now();
+    auto milliseconds = chrono::duration_cast<chrono::milliseconds>(timeend - timestart);
+
+    const unsigned char ratio = ((static_cast<float>(count_o) / count_i) * 100.0f);
+    LOG("  Done! (Time: %lu ms - Ratio: %u%%)\n", milliseconds.count(), ratio);
+
+    // Add to the global counters
+    count_i_all += count_i;
+    count_o_all += count_o;
+}
+
+int main(int argc, const char** argv)
+{
+    const char* outdir = nullptr;
+    size_t start;
+
+    // Checks the options
+    for (start = 1; start < argc; start++)
+    {
+        const char* arg = argv[start];
+
+        if (arg[0] == '-')
+        {
+            // Single letter arguments
+            if (arg[1] != '-')
+            {
+                for (size_t i = 1; arg[i] != '\0'; i++)
+                {
+                    switch (arg[i])
+                    {
+                        case '?':
+                        case 'h':
+                            usage(argv[0]);
+                            return 0;
+                        case 'i':
+                            inplace = true;
+                            break;
+                        case 'l':
+                            if (start + 1 >= argc)
+                            {
+                                fprintf(stderr, "Need to supply a log file after -l,--log!\n");
+                                return 2;
+                            }
+                            savelog = argv[++start];
+                            break;
+                        case 'o':
+                            if (start + 1 >= argc)
+                            {
+                                fprintf(stderr, "Need to supply a directory after -o,--output!\n");
+                                return 2;
+                            }
+                            outdir = argv[++start];
+                            break;
+                        case 'p':
+                            prefab = true;
+                            break;
+                        case 'c':
+                        case 'r':
+                            carriages = true;
+                            break;
+                        case 'v':
+                            verbose = true;
+                            break;
+                        default:
+                            fprintf(stderr, "Unrecognized option: %s\n", arg);
+                            usage(argv[0]);
+                            return 2;
+                    }
+                }
+            }
+            // Long words arguments
+            else
+            {
+                if (strcmp(arg, "--help") == 0)
+                {
+                    usage(argv[0]);
+                    return 0;
+                }
+                else if (strcmp(arg, "--verbose") == 0)
+                    verbose = true;
+                else if (strcmp(arg, "--in-place") == 0 || strcmp(arg, "--inplace") == 0)
+                    inplace = true;
+                else if (strcmp(arg, "--log") == 0)
+                {
+                    if (start + 1 >= argc)
+                    {
+                        fprintf(stderr, "Need to supply a log file after -l,--log!\n");
+                        return 2;
+                    }
+                    savelog = argv[++start];
+                }
+                else if (strcmp(arg, "--output") == 0)
+                {
+                    if (start + 1 >= argc)
+                    {
+                        fprintf(stderr, "Need to supply a directory after -o,--output!\n");
+                        return 2;
+                    }
+                    outdir = argv[++start];
+                }
+                else if (strcmp(arg, "--prefab") == 0)
+                    prefab = true;
+                else if (strcmp(arg, "--skip-solids") == 0)
+                    process_solids = false;
+                else if (strcmp(arg, "--skip-defaults") == 0)
+                    process_entities = false;
+                else if (strcmp(arg, "--remove-comment") == 0)
+                    remove_comment = true;
+                else if (strcmp(arg, "--keep-vert-plus") == 0)
+                    remove_vplus = false;
+                else if (strcmp(arg, "--keep-whitespace") == 0)
+                    strip_ws = false;
+                else if (strcmp(arg, "--carriages") == 0)
+                    carriages = true;
+                else if (strcmp(arg, "--") == 0)
+                    break;
+                else
+                {
+                    fprintf(stderr, "Unrecognized option: %s\n", arg);
+                    usage(argv[0]);
+                    return 2;
+                }
+            }
+        }
+        // Stop parsing arguments
+        else
+            break;
+    }
+
+    // Create the log file
+    if (savelog)
+    {
+        log = fopen(savelog, "ab");
+        if (!log)
+        {
+            fprintf(stderr, "Failed to open/create log file: %s\n", savelog);
+            savelog = nullptr;
+        }
+    }
+
+    if (start >= argc)
+    {
+        usage(argv[0]);
+        return 0;
+    }
+
+    // Create the output directory if doesn't exists
+    if (outdir)
+    {
+        if (access(outdir, W_OK) != 0)
+        {
+            fprintf(stderr, "Cannot access to output directory: %s\n", outdir);
+            return 1;
+        }
+    }
+
+    // Process each input file
+    unsigned short int filecount = 0;
+    for (; start < argc; start++)
+    {
+        // Open the files
+        ifstream in;
+        ofstream out;
+        in.open(argv[start], ifstream::binary);
+        if (!in)
+        {
+            LOG("ERROR: Could not open file: %s\n", argv[start]);
+            continue;
+        }
+
+        // Create the temporary file
+#ifdef _WIN32
+        char temp_name[PATH_MAX];
+        const char* temp = getenv("TEMP");
+        const size_t temp_len = strlen(temp);
+        memcpy(temp_name, temp, temp_len);
+        memcpy(&temp_name[temp_len], "\\.vmfoXXXXXX", temp_len);
+        if (!_mktemp(temp_name))
+#else
+        char temp_name[PATH_MAX] = "/tmp/.vmfoXXXXXX";
+        if (!mkstemp(temp_name))
+#endif
+        {
+            LOG("ERROR: Could not create temporary file!\n");
+            goto CLOSE_IN;
+        }
+        out.open(temp_name, ofstream::binary);
+        if (!out)
+        {
+            LOG("ERROR: Could not open temporary file: %s\n", temp_name);
+            goto CLOSE_IN;
+        }
+
+        LOG("INFO:  Compressing: %s...", argv[start]);
+        optimize(in, out);
+        filecount++;
+
+        // Close the files
+        out.close();
+      CLOSE_IN:
+        in.close();
+
+        // Move the output file
+        if (inplace)
+        {
+            if (remove(argv[start]) != 0 && rename(temp_name, argv[start]) != 0)
+            {
+                LOG("ERROR: Failed to replace the file: %s\n", argv[start]);
+                continue;
+            }
+        }
+        else
+        {
+            const string filename(argv[start]);
+            string new_name;
+            if (outdir)
+            {
+                new_name = outdir;
+                new_name.append(filename.substr(filename.find_last_of("/\\") + 1));
+            }
+            else
+            {
+                new_name = filename;
+                new_name.erase(new_name.length() - 4).append(suffix).append(".vmf");
+            }
+            if (access(new_name.c_str(), F_OK) == 0)
+                remove(new_name.c_str());
+            if (rename(temp_name, new_name.c_str()) != 0)
+            {
+                LOG("ERROR: Failed to rename the file: %s\n", argv[start]);
+                continue;
+            }
+        }
+    }
+
+    if (filecount == 0)
+        return 1;
+
+    const unsigned char ratio = ((static_cast<float>(count_o_all) / count_i_all) * 100.0f);
+    LOG("Successful compression of %u files!\n  Global ratio: %u%%\n", filecount, ratio);
     return 0;
 }
